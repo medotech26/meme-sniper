@@ -1,13 +1,11 @@
 # dependencies
 node_modules/
-client/node_modules/
-server/node_modules/
 
 # environment — never commit real keys
 server/.env
 .env
 
-# runtime data — personal trade history
+# runtime data — personal trade history, regenerated on first run
 data/trades.json
 data/portfolio.json
 data/logs.json
