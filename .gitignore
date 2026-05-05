@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# environment — never commit real keys
+server/.env
+.env
+
+# runtime data — personal trade history
+data/trades.json
+data/portfolio.json
+data/logs.json
+data/automation.json
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# build output
+client/build/
