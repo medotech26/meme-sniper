@@ -40,6 +40,69 @@ async function appendLog(entry) {
   await writeJSON(LOGS_FILE, logs);
 }
 
+// ─── Price Verification ──────────────────────────────────────────────────────
+// Cross-checks price from multiple DexScreener endpoints to prevent bad data
+async function verifyPrice(trade) {
+  const prices = [];
+
+  // Source 1: Pair-specific endpoint
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/pairs/${trade.chain}/${trade.pairAddress}`);
+    const d = await r.json();
+    const p = parseFloat(d.pairs?.[0]?.priceUsd || d.pair?.priceUsd);
+    const liq = d.pairs?.[0]?.liquidity?.usd || d.pair?.liquidity?.usd || 0;
+    const vol = d.pairs?.[0]?.volume?.h24 || d.pair?.volume?.h24 || 0;
+    if (p > 0) prices.push({ source: 'pair', price: p, liquidity: liq, volume: vol });
+  } catch {}
+
+  // Source 2: Token address endpoint
+  if (trade.baseTokenAddress) {
+    try {
+      const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${trade.baseTokenAddress}`);
+      const d = await r.json();
+      // Find the matching pair specifically
+      const match = (d.pairs || []).find(p => p.pairAddress === trade.pairAddress);
+      if (match) {
+        const p = parseFloat(match.priceUsd);
+        if (p > 0) prices.push({ source: 'token', price: p, liquidity: match.liquidity?.usd || 0, volume: match.volume?.h24 || 0 });
+      }
+    } catch {}
+  }
+
+  if (prices.length === 0) {
+    return { verified: false, price: null, reason: 'no_price_data', prices };
+  }
+
+  const primary = prices[0];
+
+  // If we got prices from both sources, they should be within 10% of each other
+  if (prices.length >= 2) {
+    const diff = Math.abs(prices[0].price - prices[1].price) / Math.min(prices[0].price, prices[1].price);
+    if (diff > 0.10) {
+      return { verified: false, price: null, reason: `price_mismatch_${(diff * 100).toFixed(1)}pct`, prices };
+    }
+  }
+
+  // Check: sale value shouldn't exceed liquidity by more than 5x (indicates stale/bad data)
+  const saleValue = trade.units * primary.price;
+  if (primary.liquidity > 0 && saleValue > primary.liquidity * 5) {
+    return { verified: false, price: null, reason: `sale_exceeds_liquidity_${(saleValue / primary.liquidity).toFixed(1)}x`, prices };
+  }
+
+  // Check: price movement sanity — compare with entry price and time elapsed
+  const pnlPct = ((primary.price - trade.entryPrice) / trade.entryPrice) * 100;
+  const ageMinutes = (Date.now() - new Date(trade.ts).getTime()) / 60000;
+
+  // If gain is > 5000% in under 30 minutes with liquidity under $50k, require second source confirmation
+  if (pnlPct > 5000 && ageMinutes < 30 && primary.liquidity < 50000) {
+    if (prices.length < 2) {
+      return { verified: false, price: null, reason: `extreme_gain_${pnlPct.toFixed(0)}pct_in_${ageMinutes.toFixed(0)}min_unconfirmed`, prices };
+    }
+  }
+
+  return { verified: true, price: primary.price, liquidity: primary.liquidity, volume: primary.volume, pnlPct, prices };
+}
+
 // ─── DexScreener proxy ───────────────────────────────────────────────────────
 app.get('/api/dex/new', async (req, res) => {
   try {
@@ -251,7 +314,20 @@ app.post('/api/trades/sell', async (req, res) => {
   const trade = trades.find(t => t.id === tradeId && t.status === 'OPEN');
   if (!trade) return res.status(404).json({ error: 'Open trade not found' });
 
-  const exitPrice = parseFloat(currentPrice) || trade.entryPrice;
+  // Verify price from DexScreener before executing
+  const verification = await verifyPrice(trade);
+  let exitPrice;
+
+  if (verification.verified) {
+    exitPrice = verification.price;
+  } else {
+    // If verification fails but we have a provided price, check if it's from an internal source (automation already verified)
+    // For manual sells with unverified data, block the trade
+    console.log(`⛔ SELL BLOCKED for ${trade.symbol}: ${verification.reason}`);
+    await appendLog({ type: 'sell_blocked', symbol: trade.symbol, reason: verification.reason, providedPrice: currentPrice, entryPrice: trade.entryPrice });
+    return res.status(400).json({ error: `Price verification failed: ${verification.reason}. Try again in a moment.` });
+  }
+
   const saleValue = trade.units * exitPrice;
   const pnl = saleValue - trade.usdAmount;
   const pnlPct = (pnl / trade.usdAmount) * 100;
@@ -263,12 +339,13 @@ app.post('/api/trades/sell', async (req, res) => {
   trade.pnl = pnl;
   trade.pnlPct = pnlPct;
   trade.closeReason = reason || 'manual';
+  trade.priceVerified = true;
 
   portfolio.cash += saleValue;
 
   await writeJSON(PORTFOLIO_FILE, portfolio);
   await writeJSON(TRADES_FILE, trades);
-  await appendLog({ type: 'trade_sell', symbol: trade.symbol, pnl, pnlPct, exitPrice, reason, cashAfter: portfolio.cash });
+  await appendLog({ type: 'trade_sell', symbol: trade.symbol, pnl, pnlPct, exitPrice, reason, cashAfter: portfolio.cash, verified: true });
 
   res.json({ trade, portfolio });
 });
@@ -281,16 +358,19 @@ app.post('/api/trades/sell-all', async (_req, res) => {
   if (open.length === 0) return res.json({ closed: 0, portfolio });
 
   let totalSaleValue = 0;
+  let blocked = 0;
 
   await Promise.allSettled(open.map(async (trade) => {
-    let exitPrice = trade.entryPrice;
-    try {
-      const r = await fetch(`https://api.dexscreener.com/latest/dex/pairs/${trade.chain}/${trade.pairAddress}`);
-      const d = await r.json();
-      const price = parseFloat(d.pairs?.[0]?.priceUsd || d.pair?.priceUsd);
-      if (price > 0) exitPrice = price;
-    } catch {}
+    // Verify price before selling
+    const verification = await verifyPrice(trade);
+    if (!verification.verified) {
+      console.log(`   ⛔ SELL-ALL SKIP ${trade.symbol}: ${verification.reason}`);
+      await appendLog({ type: 'sell_blocked', symbol: trade.symbol, reason: verification.reason });
+      blocked++;
+      return;
+    }
 
+    const exitPrice = verification.price;
     const saleValue = trade.units * exitPrice;
     const pnl = saleValue - trade.usdAmount;
     const pnlPct = (pnl / trade.usdAmount) * 100;
@@ -302,6 +382,7 @@ app.post('/api/trades/sell-all', async (_req, res) => {
     trade.pnl = pnl;
     trade.pnlPct = pnlPct;
     trade.closeReason = 'sell_all';
+    trade.priceVerified = true;
 
     totalSaleValue += saleValue;
     console.log(`   🔴 SELL-ALL: ${trade.symbol} @ ${exitPrice} | PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct.toFixed(1)}%)`);
@@ -310,10 +391,11 @@ app.post('/api/trades/sell-all', async (_req, res) => {
   portfolio.cash += totalSaleValue;
   await writeJSON(PORTFOLIO_FILE, portfolio);
   await writeJSON(TRADES_FILE, trades);
-  await appendLog({ type: 'sell_all', count: open.length, totalSaleValue, cashAfter: portfolio.cash });
+  await appendLog({ type: 'sell_all', count: open.length - blocked, blocked, totalSaleValue, cashAfter: portfolio.cash });
 
-  console.log(`\n💥 SELL ALL — closed ${open.length} position(s), returned $${totalSaleValue.toFixed(2)} to cash\n`);
-  res.json({ closed: open.length, totalSaleValue, portfolio });
+  const closed = open.filter(t => t.status === 'CLOSED').length;
+  console.log(`\n💥 SELL ALL — closed ${closed} position(s), blocked ${blocked}, returned $${totalSaleValue.toFixed(2)} to cash\n`);
+  res.json({ closed, blocked, totalSaleValue, portfolio });
 });
 
 // ─── Automation ──────────────────────────────────────────────────────────────
@@ -407,12 +489,23 @@ async function runAutomation() {
         if (pnlPct <= -cfg.stopLossPct)    { shouldSell = true; reason = `stop_loss_${pnlPct.toFixed(1)}pct`; }
 
         if (shouldSell) {
-          console.log(`   🔴 AUTO-SELL: ${trade.symbol} | Reason: ${reason} | PnL: ${pnlPct.toFixed(1)}%`);
+          // Verify price before executing sell
+          const verification = await verifyPrice(trade);
+          if (!verification.verified) {
+            console.log(`   ⛔ ${trade.symbol}: price verification FAILED — ${verification.reason}`);
+            await appendLog({ type: 'automation_sell_blocked', symbol: trade.symbol, reason: verification.reason, batchPrice: currentPrice, entryPrice: trade.entryPrice });
+            continue;
+          }
+
+          const verifiedPrice = verification.price;
+          const verifiedPnlPct = ((verifiedPrice - trade.entryPrice) / trade.entryPrice) * 100;
+          console.log(`   ✅ ${trade.symbol}: price VERIFIED at ${verifiedPrice} (pnl=${verifiedPnlPct.toFixed(1)}%)`);
+          console.log(`   🔴 AUTO-SELL: ${trade.symbol} | Reason: ${reason} | PnL: ${verifiedPnlPct.toFixed(1)}%`);
           await fetch('http://localhost:3001/api/trades/sell', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tradeId: trade.id, currentPrice, reason })
+            body: JSON.stringify({ tradeId: trade.id, currentPrice: verifiedPrice, reason })
           });
-          await appendLog({ type: 'automation_sell', symbol: trade.symbol, pnlPct, reason });
+          await appendLog({ type: 'automation_sell', symbol: trade.symbol, pnlPct: verifiedPnlPct, reason, verified: true });
         }
       }
     }

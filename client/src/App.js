@@ -332,6 +332,7 @@ export default function App() {
                     <div>
                       <div style={{ fontSize:12, fontWeight:700, display:'flex', alignItems:'center', gap:6 }}>
                         {t.baseToken?.name || t.baseToken?.symbol}
+                        {t.url && <a href={t.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize:9, color:'#4db8ff', textDecoration:'none', opacity:0.7 }} title="DexScreener">↗</a>}
                         {isNew && <span style={{ fontSize:8, padding:'1px 5px', background:'rgba(180,110,255,0.15)', color:'#b87bff', border:'1px solid rgba(180,110,255,0.3)', borderRadius:3 }}>NEW</span>}
                         {hasPos && <span style={{ fontSize:8, padding:'1px 5px', background:'rgba(255,233,77,0.15)', color:'#ffe94d', border:'1px solid rgba(255,233,77,0.3)', borderRadius:3 }}>IN</span>}
                         {liq < 2000 && <span style={{ fontSize:8, padding:'1px 5px', background:'rgba(255,58,92,0.1)', color:'#ff3a5c', border:'1px solid rgba(255,58,92,0.25)', borderRadius:3 }}>⚠</span>}
@@ -572,7 +573,7 @@ export default function App() {
                   return (
                     <div key={t.id} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'10px 0', borderBottom:'1px solid #111' }}>
                       <div>
-                        <strong>{t.symbol}</strong>
+                        <strong>{t.dexUrl ? <a href={t.dexUrl} target="_blank" rel="noreferrer" style={{ color:'inherit', textDecoration:'none', borderBottom:'1px dotted #4db8ff' }}>{t.symbol} <span style={{ fontSize:9, color:'#4db8ff' }}>↗</span></a> : t.symbol}</strong>
                         <span style={{ marginLeft:8, fontSize:9, color:'#666' }}>{t.chain}</span>
                         {t.aiVerdict && <SigBadge verdict={t.aiVerdict} />}
                       </div>
@@ -684,7 +685,7 @@ export default function App() {
                       onMouseLeave={e => e.currentTarget.style.background='transparent'}>
                       <td style={{ padding:'7px 12px', color:'#666', fontSize:10, whiteSpace:'nowrap' }}>{fmtDate(t.ts)}</td>
                       <td style={{ padding:'7px 12px', color: t.exitTs ? '#888' : '#333', fontSize:10, whiteSpace:'nowrap' }}>{fmtDate(t.exitTs)}</td>
-                      <td style={{ padding:'7px 12px', fontWeight:700 }}>{t.symbol}</td>
+                      <td style={{ padding:'7px 12px', fontWeight:700 }}>{t.dexUrl ? <a href={t.dexUrl} target="_blank" rel="noreferrer" style={{ color:'inherit', textDecoration:'none', borderBottom:'1px dotted #4db8ff' }}>{t.symbol} <span style={{ fontSize:9, color:'#4db8ff' }}>↗</span></a> : t.symbol}</td>
                       <td style={{ padding:'7px 12px', color:'#888', fontSize:10, textTransform:'uppercase' }}>{t.chain}</td>
                       <td style={{ padding:'7px 12px' }}><span style={{ color: t.type==='BUY'?'#39ff5a':'#ff3a5c', fontWeight:700 }}>{t.type}</span></td>
                       <td style={{ padding:'7px 12px' }}>{fmt(t.entryPrice)}</td>
